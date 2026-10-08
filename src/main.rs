@@ -233,24 +233,36 @@ struct GeneratedResult<'a> {
 
 #[derive(Default)]
 struct ProbeStats {
-    accepted: usize,
-    rejected: usize,
-    unknown: usize,
+    accepted_by_mx: usize,
+    recipient_rejected: usize,
+    temporary_failure: usize,
+    policy_blocked: usize,
+    permanent_failure: usize,
+    inconclusive: usize,
     invalid: usize,
 }
 
 impl ProbeStats {
     fn record(&mut self, status: ProbeStatus) {
         match status {
-            ProbeStatus::Accepted => self.accepted += 1,
-            ProbeStatus::Rejected => self.rejected += 1,
-            ProbeStatus::Unknown => self.unknown += 1,
+            ProbeStatus::AcceptedByMx => self.accepted_by_mx += 1,
+            ProbeStatus::RecipientRejected => self.recipient_rejected += 1,
+            ProbeStatus::TemporaryFailure => self.temporary_failure += 1,
+            ProbeStatus::PolicyBlocked => self.policy_blocked += 1,
+            ProbeStatus::PermanentFailure => self.permanent_failure += 1,
+            ProbeStatus::Inconclusive => self.inconclusive += 1,
             ProbeStatus::Invalid => self.invalid += 1,
         }
     }
 
     fn total(&self) -> usize {
-        self.accepted + self.rejected + self.unknown + self.invalid
+        self.accepted_by_mx
+            + self.recipient_rejected
+            + self.temporary_failure
+            + self.policy_blocked
+            + self.permanent_failure
+            + self.inconclusive
+            + self.invalid
     }
 }
 
@@ -467,12 +479,13 @@ async fn probe_candidates(
             .probe_once(format!("mprobe-{nonce:x}@{target}"))
             .await;
         match catch_all.status {
-            ProbeStatus::Accepted => eprintln!(
+            ProbeStatus::AcceptedByMx => eprintln!(
                 "{} the domain accepted a random address; {}",
                 stderr_theme.warning("[!]"),
-                stderr_theme.secondary("accepted results may be catch-all responses")
+                stderr_theme.secondary("accepted_by_mx results may be catch-all responses")
             ),
-            ProbeStatus::Unknown if !cli.quiet => eprintln!(
+            ProbeStatus::RecipientRejected => {}
+            _ if !cli.quiet => eprintln!(
                 "{} catch-all status could not be determined: {}",
                 stderr_theme.info("[i]"),
                 stderr_theme.secondary(&catch_all.detail)
@@ -567,14 +580,17 @@ async fn probe_candidates(
             stats.total() as f64 / elapsed.as_secs_f64()
         };
         eprintln!(
-            "{} completed {} checks in {} ({}): {} accepted, {} rejected, {} unknown, {} invalid",
+            "{} completed {} checks in {} ({}): {} accepted by MX, {} recipient rejected, {} temporary, {} policy blocked, {} permanent, {} inconclusive, {} invalid",
             stderr_theme.info("[i]"),
             stderr_theme.bold(stats.total()),
             stderr_theme.bold(format!("{elapsed:.2?}")),
             stderr_theme.secondary(format!("{rate:.1}/s")),
-            stderr_theme.success(stats.accepted),
-            stderr_theme.error(stats.rejected),
-            stderr_theme.warning(stats.unknown),
+            stderr_theme.success(stats.accepted_by_mx),
+            stderr_theme.error(stats.recipient_rejected),
+            stderr_theme.warning(stats.temporary_failure),
+            stderr_theme.warning(stats.policy_blocked),
+            stderr_theme.error(stats.permanent_failure),
+            stderr_theme.warning(stats.inconclusive),
             stderr_theme.accent(stats.invalid)
         );
     }
@@ -588,7 +604,7 @@ async fn write_probe_results(
     mut results: mpsc::Receiver<ProbeResult>,
 ) -> Result<ProbeStats> {
     if matches!(format, OutputFormat::Csv) {
-        writeln!(writer, "email,status,code,mx,detail")?;
+        writeln!(writer, "email,status,code,enhanced_code,mx,detail")?;
     }
     let mut stats = ProbeStats::default();
     let mut buffered = 0_usize;
@@ -627,23 +643,35 @@ fn write_probe_result(
     match format {
         OutputFormat::Plain => {
             let status = match result.status {
-                ProbeStatus::Accepted => theme.success(format!("[{}]", result.status)),
-                ProbeStatus::Rejected => theme.error(format!("[{}]", result.status)),
-                ProbeStatus::Unknown => theme.warning(format!("[{}]", result.status)),
+                ProbeStatus::AcceptedByMx => theme.success(format!("[{}]", result.status)),
+                ProbeStatus::RecipientRejected | ProbeStatus::PermanentFailure => {
+                    theme.error(format!("[{}]", result.status))
+                }
+                ProbeStatus::TemporaryFailure
+                | ProbeStatus::PolicyBlocked
+                | ProbeStatus::Inconclusive => theme.warning(format!("[{}]", result.status)),
                 ProbeStatus::Invalid => theme.accent(format!("[{}]", result.status)),
             };
-            writeln!(writer, "{status} {}", result.email)?;
+            write!(writer, "{status} {}", result.email)?;
+            if let Some(code) = result.code {
+                write!(writer, " smtp={code}")?;
+            }
+            if let Some(enhanced_code) = result.enhanced_code.as_deref() {
+                write!(writer, " enhanced={enhanced_code}")?;
+            }
+            writeln!(writer)?;
         }
         OutputFormat::Jsonl => writeln!(writer, "{}", serde_json::to_string(result)?)?,
         OutputFormat::Csv => writeln!(
             writer,
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{}",
             csv_escape(&result.email),
             result.status,
             result
                 .code
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+            result.enhanced_code.as_deref().unwrap_or_default(),
             csv_escape(result.mx.as_deref().unwrap_or_default()),
             csv_escape(&result.detail)
         )?,
@@ -704,5 +732,31 @@ mod tests {
     #[test]
     fn escapes_csv_fields() {
         assert_eq!(csv_escape("a,\"b"), "\"a,\"\"b\"");
+    }
+
+    #[test]
+    fn writes_observed_codes_in_plain_and_csv_formats() {
+        let result = ProbeResult {
+            email: "person@example.test".to_owned(),
+            status: ProbeStatus::PolicyBlocked,
+            code: Some(550),
+            enhanced_code: Some("5.7.1".to_owned()),
+            mx: Some("mx.example.test".to_owned()),
+            detail: "blocked by policy".to_owned(),
+        };
+
+        let mut plain = Vec::new();
+        write_probe_result(&mut plain, OutputFormat::Plain, Theme::plain(), &result).unwrap();
+        assert_eq!(
+            String::from_utf8(plain).unwrap(),
+            "[policy_blocked] person@example.test smtp=550 enhanced=5.7.1\n"
+        );
+
+        let mut csv = Vec::new();
+        write_probe_result(&mut csv, OutputFormat::Csv, Theme::plain(), &result).unwrap();
+        assert_eq!(
+            String::from_utf8(csv).unwrap(),
+            "\"person@example.test\",policy_blocked,550,5.7.1,\"mx.example.test\",\"blocked by policy\"\n"
+        );
     }
 }

@@ -70,7 +70,21 @@ Interactive runs also show the `mprobe` startup banner with blank-line separatio
 
 ## SMTP probing caveats
 
-`--probe` performs `EHLO`, `MAIL FROM`, and `RCPT TO` without sending a message. `accepted` means the MX server returned an SMTP acceptance response at that moment; it does not prove that a mailbox is active or that a later message will be delivered. Many providers deliberately hide mailbox status, rate-limit checks, accept every recipient, or reject after message content is submitted. `mprobe` tests a random address first and warns if the domain appears to be catch-all. `unknown` does not mean a mailbox exists or does not exist.
+`--probe` performs `EHLO`, `MAIL FROM`, and `RCPT TO` without sending a message. Reports describe what the MX server observed; they do not claim that a mailbox or person exists:
+
+| Status | Meaning |
+| --- | --- |
+| `accepted_by_mx` | The MX accepted `RCPT TO` with `250` or `251`; delivery and mailbox existence remain unproven. |
+| `recipient_rejected` | The MX returned a recipient-address failure such as enhanced status `5.1.1`. |
+| `temporary_failure` | The MX returned a `4xx` response; no existence conclusion can be made. |
+| `policy_blocked` | Enhanced status `4.7.x` or `5.7.x` indicates policy, reputation, or security blocking rather than recipient validity. |
+| `permanent_failure` | A different `5xx` response permanently rejected the SMTP command but did not specifically establish recipient validity. |
+| `inconclusive` | The response, connection, or `252` result cannot establish whether the recipient is accepted. |
+| `invalid` | The generated candidate is not a safe SMTP recipient address. |
+
+Plain output includes `smtp=` and `enhanced=` values when the server supplied them. CSV includes `code` and `enhanced_code` columns, while JSON Lines exposes the same fields as properties. For example, `smtp=550 enhanced=5.7.1` is reported as `policy_blocked`, not as a nonexistent recipient.
+
+Many providers deliberately hide mailbox status, rate-limit checks, accept every recipient, or reject after message content is submitted. `mprobe` tests a random address first and warns if the domain appears to be catch-all. No reported status proves that a mailbox belongs to a particular person.
 
 Only probe domains you own or are authorized to assess. Keep connection count, batch size, and request volume appropriate for the target.
 

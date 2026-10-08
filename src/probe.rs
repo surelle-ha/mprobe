@@ -25,18 +25,24 @@ const CIRCUIT_BREAKER_FAILURES: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeStatus {
-    Accepted,
-    Rejected,
-    Unknown,
+    AcceptedByMx,
+    RecipientRejected,
+    TemporaryFailure,
+    PolicyBlocked,
+    PermanentFailure,
+    Inconclusive,
     Invalid,
 }
 
 impl fmt::Display for ProbeStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Accepted => write!(formatter, "accepted"),
-            Self::Rejected => write!(formatter, "rejected"),
-            Self::Unknown => write!(formatter, "unknown"),
+            Self::AcceptedByMx => write!(formatter, "accepted_by_mx"),
+            Self::RecipientRejected => write!(formatter, "recipient_rejected"),
+            Self::TemporaryFailure => write!(formatter, "temporary_failure"),
+            Self::PolicyBlocked => write!(formatter, "policy_blocked"),
+            Self::PermanentFailure => write!(formatter, "permanent_failure"),
+            Self::Inconclusive => write!(formatter, "inconclusive"),
             Self::Invalid => write!(formatter, "invalid"),
         }
     }
@@ -47,6 +53,7 @@ pub struct ProbeResult {
     pub email: String,
     pub status: ProbeStatus,
     pub code: Option<u16>,
+    pub enhanced_code: Option<String>,
     pub mx: Option<String>,
     pub detail: String,
 }
@@ -171,13 +178,13 @@ impl SmtpProber {
         }
         let mut session = match self.connect_session().await {
             Ok(session) => session,
-            Err(error) => return unknown_result(email, format!("{error:#}")),
+            Err(error) => return inconclusive_result(email, format!("{error:#}")),
         };
         let outcome = session.probe_batch(&self.from, vec![email]).await;
         session.quit().await;
         match outcome {
             Ok(mut outcome) => outcome.results.pop().expect("one result for one candidate"),
-            Err(error) => unknown_result("catch-all check".to_owned(), format!("{error:#}")),
+            Err(error) => inconclusive_result("catch-all check".to_owned(), format!("{error:#}")),
         }
     }
 
@@ -194,7 +201,7 @@ impl SmtpProber {
                 if send_results(
                     &results,
                     batch.into_iter().map(|email| {
-                        unknown_result(
+                        inconclusive_result(
                             email,
                             "SMTP circuit breaker open after repeated transport failures"
                                 .to_owned(),
@@ -260,7 +267,7 @@ impl SmtpProber {
                     &results,
                     unprocessed
                         .into_iter()
-                        .map(|email| unknown_result(email, detail.clone())),
+                        .map(|email| inconclusive_result(email, detail.clone())),
                 )
                 .await
                 .is_err()
@@ -386,10 +393,13 @@ impl SmtpSession {
         let mail = self.command(&format!("MAIL FROM:<{from}>")).await?;
         if mail.code / 100 != 2 {
             let detail = format!("MAIL FROM failed with {}: {}", mail.code, mail.message());
+            let enhanced = enhanced_status(&mail);
+            let status = classify_response(mail.code, enhanced.as_ref(), false);
             results.extend(valid.into_iter().map(|email| ProbeResult {
                 email,
-                status: ProbeStatus::Unknown,
+                status,
                 code: Some(mail.code),
+                enhanced_code: enhanced.as_ref().map(|value| value.code.clone()),
                 mx: Some(self.mx.clone()),
                 detail: detail.clone(),
             }));
@@ -461,6 +471,14 @@ struct Response {
     lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnhancedStatus {
+    code: String,
+    class: u16,
+    subject: u16,
+    detail: u16,
+}
+
 impl Response {
     fn message(&self) -> String {
         self.lines.join(" ")
@@ -511,17 +529,65 @@ fn expect_class(response: &Response, class: u16, command: &str) -> Result<()> {
 }
 
 fn result_from_response(email: String, mx: &str, response: Response) -> ProbeResult {
-    let status = match response.code {
-        250..=252 => ProbeStatus::Accepted,
-        550 | 551 | 552 | 553 | 554 | 556 => ProbeStatus::Rejected,
-        _ => ProbeStatus::Unknown,
-    };
+    let enhanced = enhanced_status(&response);
+    let status = classify_response(response.code, enhanced.as_ref(), true);
     ProbeResult {
         email,
         status,
         code: Some(response.code),
+        enhanced_code: enhanced.map(|value| value.code),
         mx: Some(mx.to_owned()),
         detail: response.message(),
+    }
+}
+
+fn enhanced_status(response: &Response) -> Option<EnhancedStatus> {
+    response.lines.iter().find_map(|line| {
+        line.split_whitespace().find_map(|token| {
+            let candidate = token
+                .trim_matches(|ch: char| matches!(ch, '[' | ']' | '(' | ')' | ',' | ';' | ':'));
+            let mut parts = candidate.split('.');
+            let class = parts.next()?.parse::<u16>().ok()?;
+            let subject = parts.next()?.parse::<u16>().ok()?;
+            let detail = parts.next()?.parse::<u16>().ok()?;
+            if parts.next().is_some() || !matches!(class, 2 | 4 | 5) || subject > 7 || detail > 999
+            {
+                return None;
+            }
+            Some(EnhancedStatus {
+                code: format!("{class}.{subject}.{detail}"),
+                class,
+                subject,
+                detail,
+            })
+        })
+    })
+}
+
+fn classify_response(
+    code: u16,
+    enhanced: Option<&EnhancedStatus>,
+    recipient_response: bool,
+) -> ProbeStatus {
+    let matching_enhanced = enhanced.filter(|value| value.class == code / 100);
+    if matching_enhanced.is_some_and(|value| matches!(value.class, 4 | 5) && value.subject == 7) {
+        return ProbeStatus::PolicyBlocked;
+    }
+
+    match code {
+        250 | 251 if recipient_response => ProbeStatus::AcceptedByMx,
+        252 if recipient_response => ProbeStatus::Inconclusive,
+        400..=499 => ProbeStatus::TemporaryFailure,
+        500..=599
+            if recipient_response
+                && (matching_enhanced.is_some_and(|value| {
+                    value.subject == 1 && matches!(value.detail, 1 | 2 | 3 | 4 | 6 | 10)
+                }) || matches!(code, 551 | 553 | 556)) =>
+        {
+            ProbeStatus::RecipientRejected
+        }
+        500..=599 => ProbeStatus::PermanentFailure,
+        _ => ProbeStatus::Inconclusive,
     }
 }
 
@@ -539,16 +605,18 @@ fn invalid_result(email: String) -> ProbeResult {
         email,
         status: ProbeStatus::Invalid,
         code: None,
+        enhanced_code: None,
         mx: None,
         detail: "candidate is not a safe SMTP recipient address".to_owned(),
     }
 }
 
-fn unknown_result(email: String, detail: String) -> ProbeResult {
+fn inconclusive_result(email: String, detail: String) -> ProbeResult {
     ProbeResult {
         email,
-        status: ProbeStatus::Unknown,
+        status: ProbeStatus::Inconclusive,
         code: None,
+        enhanced_code: None,
         mx: None,
         detail,
     }
@@ -618,7 +686,7 @@ mod tests {
                 } else if line.starts_with("RCPT TO") {
                     rcpt_count += 1;
                     if line.contains("missing") {
-                        b"550 no such user\r\n"
+                        b"550 5.1.1 no such user\r\n"
                     } else {
                         b"250 recipient accepted\r\n"
                     }
@@ -649,10 +717,63 @@ mod tests {
             .await
             .unwrap();
         assert!(first.reusable && second.reusable);
-        assert_eq!(first.results[0].status, ProbeStatus::Accepted);
-        assert_eq!(first.results[1].status, ProbeStatus::Rejected);
-        assert_eq!(second.results[0].status, ProbeStatus::Accepted);
+        assert_eq!(first.results[0].status, ProbeStatus::AcceptedByMx);
+        assert_eq!(first.results[1].status, ProbeStatus::RecipientRejected);
+        assert_eq!(first.results[1].enhanced_code.as_deref(), Some("5.1.1"));
+        assert_eq!(second.results[0].status, ProbeStatus::AcceptedByMx);
         session.quit().await;
         assert_eq!(server.await.unwrap(), 3);
+    }
+
+    #[test]
+    fn classifies_recipient_responses_without_claiming_mailbox_existence() {
+        let cases = [
+            (250, "2.1.5 recipient accepted", ProbeStatus::AcceptedByMx),
+            (250, "2.7.0 security applied", ProbeStatus::AcceptedByMx),
+            (
+                251,
+                "user not local; will forward",
+                ProbeStatus::AcceptedByMx,
+            ),
+            (252, "cannot verify user", ProbeStatus::Inconclusive),
+            (450, "4.2.0 mailbox busy", ProbeStatus::TemporaryFailure),
+            (421, "4.7.0 rate limited", ProbeStatus::PolicyBlocked),
+            (550, "5.1.1 user unknown", ProbeStatus::RecipientRejected),
+            (
+                550,
+                "5.1.8 bad sender system address",
+                ProbeStatus::PermanentFailure,
+            ),
+            (550, "5.7.1 blocked by policy", ProbeStatus::PolicyBlocked),
+            (550, "mailbox unavailable", ProbeStatus::PermanentFailure),
+            (552, "5.2.2 mailbox full", ProbeStatus::PermanentFailure),
+            (551, "user not local", ProbeStatus::RecipientRejected),
+        ];
+
+        for (code, message, expected) in cases {
+            let result = result_from_response(
+                "person@example.test".to_owned(),
+                "mx.example.test",
+                Response {
+                    code,
+                    lines: vec![message.to_owned()],
+                },
+            );
+            assert_eq!(result.status, expected, "{code} {message}");
+        }
+    }
+
+    #[test]
+    fn extracts_enhanced_status_codes() {
+        let result = result_from_response(
+            "person@example.test".to_owned(),
+            "mx.example.test",
+            Response {
+                code: 550,
+                lines: vec!["[5.7.1] blocked using a reputation list".to_owned()],
+            },
+        );
+        assert_eq!(result.status, ProbeStatus::PolicyBlocked);
+        assert_eq!(result.enhanced_code.as_deref(), Some("5.7.1"));
     }
 }
