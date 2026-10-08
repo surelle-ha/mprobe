@@ -1,0 +1,6 @@
+/target/
+*.jsonl
+
+# Generated probe output can contain sensitive target data.
+/*-debug.csv
+/result.txt
